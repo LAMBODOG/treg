@@ -580,7 +580,65 @@ def _forget_ad_link() -> None:
         pass
 
 
+# An affiliate partner's code (their Dub link key) for the team this person creates next. `treg login
+# --ref`, `install.sh --ref` (which writes the file) or `TREG_REF` set it; the server reads it at team
+# creation. Same shape as the server's partner-code allowlist. Never a friend-referral code: the friend
+# referral comes only from a `?ref=` link.
+_REF_RE = re.compile(r"[a-z0-9][a-z0-9-]{2,31}")
+
+
+def _ref_path() -> Path:
+    return CONFIG_PATH.parent / "ref"
+
+
+def _valid_ref(value: str | None) -> str:
+    value = (value or "").strip().lower()
+    return value if _REF_RE.fullmatch(value) else ""
+
+
+def _pending_ref() -> str:
+    """`TREG_REF` wins, then the code a previous `treg login --ref` or `install.sh --ref` left."""
+    if env := _valid_ref(os.environ.get("TREG_REF")):
+        return env
+    try:
+        return _valid_ref(_ref_path().read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+
+
+def _remember_ref(code: str) -> None:
+    _ref_path().parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _ref_path().write_text(code + "\n", encoding="utf-8")
+
+
+def _forget_ref() -> None:
+    try:
+        _ref_path().unlink()
+    except OSError:
+        pass
+
+
+def _ref_from_args(args) -> str:
+    """The `--ref` given on this command, validated; exits on a malformed one rather than drop it."""
+    raw = getattr(args, "ref", None)
+    if raw is None:
+        return ""
+    code = _valid_ref(raw)
+    if not code:
+        sys.exit(f"--ref {raw!r} is not an affiliate partner code (3-32 lowercase letters, digits or hyphens).")
+    return code
+
+
+def _settle_ref(cfg: dict) -> None:
+    """After sign-in: a person who already has a team made it without this code, so the code is
+    spent. One without a team keeps it for `treg org create`."""
+    if cfg.get("active_org"):
+        _forget_ref()
+
+
 def cmd_login(args, cfg) -> None:
+    if code := _ref_from_args(args):
+        _remember_ref(code)
     if args.token:  # agent / CI: a token directly (a per-org token, or a dashboard identity token)
         # A typed human Default/bootstrap is still an identity credential and may participate in
         # the CLI's deliberate team-selection flow. Opaque Additional/Agent keys stay fixed to the
@@ -604,6 +662,7 @@ def cmd_login(args, cfg) -> None:
         cfg["email"] = who.json().get("email")
         _save_config(cfg)  # persist only a VERIFIED token
         _pick_active_org(cfg)
+        _settle_ref(cfg)
         if cfg.get("active_org"):
             print(f"✓ Token saved. Active org: {cfg['active_org']}")
         else:  # a valid identity/token whose user has no team yet — the calls would 400 "choose an org"
@@ -635,6 +694,7 @@ def cmd_login(args, cfg) -> None:
             _save_config(cfg)  # persist the freshly-minted token BEFORE the optional org lookup
             _pick_active_org(cfg, pin=False)
             _pin_token_to_active_org(cfg, session_cookies=r.cookies)
+            _settle_ref(cfg)
             print(f"✓ Logged in as {cfg['email']}. Active org: {cfg.get('active_org')}")
             _maybe_offer_onboarding(cfg)
             return
@@ -669,7 +729,9 @@ def cmd_login(args, cfg) -> None:
             f"  (error: {start_exc})"
         )
     ad_link = _pending_ad_link()
-    url = f"{base}/login?cli={lid}" + (f"&ad={ad_link}" if ad_link else "")
+    ref = _pending_ref()
+    url = (f"{base}/login?cli={lid}" + (f"&ad={ad_link}" if ad_link else "")
+           + (f"&ref={ref}" if ref else ""))
     # flush=True for non-TTY agent shells where stdout is block-buffered — the pairing code must
     # appear immediately so an agent driving a browser can see and verify it.
     print(f"Opening your browser to sign in…\nIf it doesn't open, visit:\n  {url}\n", flush=True)
@@ -701,6 +763,7 @@ def cmd_login(args, cfg) -> None:
                 # with it the pin. Pin here too, or the token this path stores works only inside the
                 # CLI (which supplies X-Treg-Org itself) and fails everywhere it gets pasted.
                 _pin_token_to_active_org(cfg)
+            _settle_ref(cfg)
             print(f"✓ Logged in as {cfg['email']}. Active org: {cfg.get('active_org')}")
             _maybe_offer_onboarding(cfg)
             return
@@ -4762,9 +4825,11 @@ def cmd_update(args, cfg) -> None:
 
 
 def cmd_org_create(args, cfg) -> None:
+    ref = _ref_from_args(args) or _pending_ref()
     with _client(cfg) as c:
-        r = c.post("/orgs", json={"name": args.name})
+        r = c.post("/orgs", json={"name": args.name, **({"ref": ref} if ref else {})})
     if r.status_code == 200:
+        _forget_ref()
         d = r.json()
         cfg.update(token=d["token"], active_org=d["org"], identity=True)
         _save_config(cfg)
@@ -6377,9 +6442,12 @@ def build_parser() -> argparse.ArgumentParser:
     lg = mk(sub, "login", "Sign in. Opens the browser sign-in page; --email for a terminal-only code; --token for agents/CI.",
             "treg login                                     # browser (reuses a dashboard session, or GitHub/Google/email)",
             "treg login --email you@company.com             # emailed 6-digit code",
-            "treg login --token <per-org-token>             # non-interactive (agents/CI)")
+            "treg login --token <per-org-token>             # non-interactive (agents/CI)",
+            "treg login --ref jane                          # an affiliate partner's code for your new team")
     lg.add_argument("--token", help="a per-org token (agents/CI) instead of the browser/email flow")
     lg.add_argument("--email", help="sign in with a one-time code emailed to this address")
+    lg.add_argument("--ref", help="an affiliate partner's code for the team you create next; "
+                                  "also read from TREG_REF")
     lg.set_defaults(fn=cmd_login)
 
     mk(sub, "logout", "Clear the stored credentials for this machine.",
@@ -6415,7 +6483,10 @@ def build_parser() -> argparse.ArgumentParser:
             "treg org ls", 'treg org create "Superdesign"', "treg org use superdesign",
             ).add_subparsers(dest="sub", required=True, metavar="<subcommand>")
     oc2 = mk(og, "create", "Create a team and become its owner.", 'treg org create "Superdesign"')
-    oc2.add_argument("name", help="the team's display name"); oc2.set_defaults(fn=cmd_org_create)
+    oc2.add_argument("name", help="the team's display name")
+    oc2.add_argument("--ref", help="an affiliate partner's code for this team; "
+                                   "defaults to TREG_REF or the code `treg login --ref` saved")
+    oc2.set_defaults(fn=cmd_org_create)
     mk(og, "ls", "List the teams you belong to (marks the active one).", "treg org ls").set_defaults(fn=cmd_org_ls)
     ou = mk(og, "use", "Switch the active team (used by later commands).", "treg org use superdesign")
     ou.add_argument("slug", help="the org slug to make active"); ou.set_defaults(fn=cmd_org_use)
