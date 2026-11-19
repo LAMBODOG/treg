@@ -66,9 +66,24 @@ That code is staged as a code-only `AffiliateLead` (`partner_code`, and `country
 else `dub_default_country`: Dub requires one for this lead; the check constraint keeps exactly one
 of `click_id` and `partner_code`). The drain resolves it with `GET /links/info` on `dub_link_domain`,
 then creates the customer under that partner with `POST /commissions` (`type: lead`), which is what
-lets later Stripe sales for the org id pay the partner (`dub.lead_from_code`). An unknown code (404)
-or a link with no partner dead-letters; an unset `dub_link_domain` retries. A dead-lettered lead
-attributes nothing: `affiliates.attributed` ignores it, so its team gets no Stripe tag.
+lets later Stripe sales for the org id pay the partner (`dub.partner_for_code`,
+`dub.lead_for_partner`). An unknown code (404) or a link with no partner dead-letters; an unset
+`dub_link_domain` retries. A dead-lettered lead attributes nothing: `affiliates.attributed` ignores
+it, so its team gets no Stripe tag.
+
+## Self-referral
+
+A partner is never credited for a team its own inbox created or owns. The drain reads the partner's
+email (`GET /partners/{id}`, `dub.partner_email`) and compares it with the creator's and every
+owner's inbox under the signup credit's one-per-inbox rule (`promotions.promo_inbox`: `+tag` and
+Gmail dots ignored), in `affiliates._is_self`.
+
+- Code lead: the check runs before `POST /commissions`. A match dead-letters the row as
+  `self_referral` and nothing reaches Dub; a failed partner lookup retries rather than block.
+- Click lead: Dub has already recorded it, so the check reads `link.partnerId` from the
+  `/track/lead` response afterwards. A match marks the row `self_referral` (uploaded and failed), so
+  the team's Stripe customer is never tagged and its top-ups pay no one. The response names no
+  partner on a deduplicated repeat; then the click path is left to Dub's own risk monitoring.
 
 ## Sales and refunds
 

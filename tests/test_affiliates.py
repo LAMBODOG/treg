@@ -21,6 +21,7 @@ from conftest import make_upstream, verified_signup
 from treg.api import app
 from treg.application import affiliates, billing
 from treg.config import get_settings
+from treg.domain.identity.promotions import promo_inbox
 from treg.infra import dub
 from treg.infra.db import reset_db, session_maker
 from treg.models import AffiliateLead, Org, Referral
@@ -314,11 +315,15 @@ async def test_cli_login_page_parks_the_partner_code_not_the_friend_cookie(c):
     assert PARTNER_CODE_COOKIE not in r.cookies
 
 
-def _code_transport(info_status: int, commission_status: int, seen: list, partner_id: str = "pn_1"):
+def _code_transport(info_status: int, commission_status: int, seen: list, partner_id: str = "pn_1",
+                    partner_email: str = "jane@partner.example", partner_status: int = 200):
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         if request.url.path == "/links/info":
             return httpx.Response(info_status, json={"partnerId": partner_id} if info_status == 200 else {})
+        if request.url.path.startswith("/partners/"):
+            return httpx.Response(partner_status, json={"id": partner_id, "email": partner_email}
+                                  if partner_status == 200 else {"error": "no"})
         return httpx.Response(commission_status, json={"success": True} if commission_status == 200 else {})
     return httpx.MockTransport(handler)
 
@@ -331,8 +336,9 @@ async def test_drain_resolves_a_code_to_its_partner_and_creates_the_lead(c, monk
         assert await affiliates.drain_once(client, session_factory=session_maker) == {"sent": 1, "retried": 0, "failed": 0}
     import json
     assert dict(seen[0].url.params) == {"domain": "treg.dub.link", "key": "jane-doe"}
-    assert str(seen[1].url) == "https://api.dub.co/commissions"
-    assert json.loads(seen[1].content) == {"type": "lead", "partnerId": "pn_1", "customer": {
+    assert str(seen[1].url) == "https://api.dub.co/partners/pn_1"
+    assert str(seen[2].url) == "https://api.dub.co/commissions"
+    assert json.loads(seen[2].content) == {"type": "lead", "partnerId": "pn_1", "customer": {
         "externalId": str(org_id), "country": "AU", "email": "bob@superdesign.dev"}}
 
 
@@ -364,3 +370,75 @@ async def test_a_code_lead_retries_on_a_server_error(c, monkeypatch):
         assert await affiliates.drain_once(client, session_factory=session_maker) == {"sent": 0, "retried": 1, "failed": 0}
     lead = (await _leads())[0]
     assert lead.failed_at is None and lead.error.startswith("503")
+
+
+async def _self_referral_lead(c, monkeypatch, partner_email: str):
+    monkeypatch.setattr(get_settings(), "dub_link_domain", "treg.dub.link")
+    org_id = (await _orgs_with_ref(c, "jane-doe")).json()["org_id"]
+    seen: list[httpx.Request] = []
+    async with httpx.AsyncClient(transport=_code_transport(200, 200, seen, partner_email=partner_email)) as client:
+        result = await affiliates.drain_once(client, session_factory=session_maker)
+    return org_id, seen, result
+
+
+async def test_a_partner_code_on_the_partners_own_team_is_dead_lettered(c, monkeypatch):
+    org_id, seen, result = await _self_referral_lead(c, monkeypatch, "bob@superdesign.dev")
+    assert result == {"sent": 0, "retried": 0, "failed": 1}
+    assert [r.url.path for r in seen] == ["/links/info", "/partners/pn_1"], "no lead is created"
+    lead = (await _leads())[0]
+    assert lead.failed_at is not None and lead.error == "self_referral" and lead.uploaded_at is None
+    async with session_maker() as db:
+        assert await affiliates.stripe_metadata(db, org_id) == {}
+
+
+async def test_self_referral_sees_through_inbox_aliases(c, monkeypatch):
+    _, _, result = await _self_referral_lead(c, monkeypatch, "Bob+affiliate@SuperDesign.dev")
+    assert result["failed"] == 1 and (await _leads())[0].error == "self_referral"
+
+
+def test_gmail_dot_aliases_are_one_inbox():
+    owner = {promo_inbox("jane.doe@gmail.com")}
+    assert affiliates._is_self(dub.Outcome(ok=True, retry=False, status=200, email="janedoe+x@googlemail.com"), owner)
+    assert not affiliates._is_self(dub.Outcome(ok=True, retry=False, status=200, email="jane@other.example"), owner)
+    assert not affiliates._is_self(dub.Outcome(ok=False, retry=True, status=503), owner)
+
+
+async def test_a_partner_lookup_failure_retries_rather_than_blocking(c, monkeypatch):
+    monkeypatch.setattr(get_settings(), "dub_link_domain", "treg.dub.link")
+    await _orgs_with_ref(c, "jane-doe")
+    seen: list[httpx.Request] = []
+    async with httpx.AsyncClient(transport=_code_transport(200, 200, seen, partner_status=503)) as client:
+        assert await affiliates.drain_once(client, session_factory=session_maker) == {"sent": 0, "retried": 1, "failed": 0}
+    assert all(r.url.path != "/commissions" for r in seen)
+    lead = (await _leads())[0]
+    assert lead.failed_at is None and lead.error.startswith("503: partner lookup")
+
+
+def _click_transport(partner_id: str | None, partner_email: str, seen: list):
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/track/lead":
+            return httpx.Response(200, json={"click": {"id": "x"}, "customer": {},
+                                             "link": {"partnerId": partner_id} if partner_id else None})
+        return httpx.Response(200, json={"id": partner_id, "email": partner_email})
+    return httpx.MockTransport(handler)
+
+
+async def test_a_click_from_the_partners_own_link_leaves_the_team_untagged(c):
+    org_id = await _attributed_team(c)
+    seen: list[httpx.Request] = []
+    async with httpx.AsyncClient(transport=_click_transport("pn_1", "bob@superdesign.dev", seen)) as client:
+        assert await affiliates.drain_once(client, session_factory=session_maker) == {"sent": 0, "retried": 0, "failed": 1}
+    lead = (await _leads())[0]
+    assert lead.error == "self_referral" and lead.uploaded_at is not None, "Dub has the lead; treg tags nothing"
+    async with session_maker() as db:
+        assert await affiliates.stripe_metadata(db, org_id) == {}
+
+
+async def test_a_click_from_another_partner_is_sent(c):
+    org_id = await _attributed_team(c)
+    seen: list[httpx.Request] = []
+    async with httpx.AsyncClient(transport=_click_transport("pn_1", "jane@partner.example", seen)) as client:
+        assert await affiliates.drain_once(client, session_factory=session_maker) == {"sent": 1, "retried": 0, "failed": 0}
+    async with session_maker() as db:
+        assert await affiliates.stripe_metadata(db, org_id) == {"dubCustomerExternalId": str(org_id)}

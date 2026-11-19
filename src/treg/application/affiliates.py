@@ -18,9 +18,10 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from ..config import get_settings
 from ..domain.identity.access import _is_machine_email
+from ..domain.identity.promotions import promo_inbox
 from ..infra import dub
 from ..infra.db import background_session_maker
-from ..models import AffiliateLead, Org, User
+from ..models import AffiliateLead, Membership, Org, User
 from ..timeutil import utcnow_naive
 
 log = logging.getLogger("treg")
@@ -30,6 +31,7 @@ DRAIN_INTERVAL_S = 30
 _BATCH = 50
 _RETRY_BASE_S = 60
 _RETRY_CAP_S = 24 * 3600
+SELF_REFERRAL = "self_referral"
 
 
 def enabled() -> bool:
@@ -92,38 +94,91 @@ async def _due(db: AsyncSession, now) -> list[tuple]:
     return [(r[0], r[1], r[2] or "", r[3] or "", r[4] or "", r[5] or "") for r in rows]
 
 
+async def _owner_inboxes(db: AsyncSession, org_ids: set[int]) -> dict[int, set[str]]:
+    rows = (await db.execute(
+        select(Membership.org_id, User.email).join(User, User.id == Membership.user_id)
+        .where(Membership.org_id.in_(org_ids), Membership.role == "owner"))).all()
+    inboxes: dict[int, set[str]] = {}
+    for org_id, email in rows:
+        if email:
+            inboxes.setdefault(org_id, set()).add(promo_inbox(email))
+    return inboxes
+
+
+def _is_self(partner: dub.Outcome, inboxes: set[str]) -> bool:
+    """The partner's own inbox owns or created the team: Gmail dots and `+tag` aliases count as one
+    inbox, the same rule as the one-per-inbox signup credit."""
+    return bool(partner.ok and partner.email and promo_inbox(partner.email) in inboxes)
+
+
+_SELF = dub.Outcome(ok=False, retry=False, status=0, detail=SELF_REFERRAL)
+
+
+async def _send(client, settings, *, org_id: int, click_id: str, email: str, partner_code: str,
+                country: str, inboxes: set[str]) -> tuple[dub.Outcome, bool]:
+    """One lead's Dub calls. Returns the outcome and whether Dub has recorded the lead."""
+    key = settings.dub_api_key
+    if click_id:
+        sent = await dub.track_lead(
+            client, api_key=key, click_id=click_id, customer_external_id=external_id(org_id),
+            event_name=settings.dub_lead_event, customer_email=email)
+        if sent.ok and sent.partner_id and _is_self(
+                await dub.partner_email(client, api_key=key, partner_id=sent.partner_id), inboxes):
+            return _SELF, True
+        return sent, sent.ok
+    found = await dub.partner_for_code(client, api_key=key, link_domain=settings.dub_link_domain,
+                                       code=partner_code)
+    if not found.ok:
+        return found, False
+    partner = await dub.partner_email(client, api_key=key, partner_id=found.partner_id)
+    if not partner.ok:
+        return dub.Outcome(ok=False, retry=True, status=partner.status,
+                           detail=f"partner lookup: {partner.detail}"[:300]), False
+    if _is_self(partner, inboxes):
+        return _SELF, False
+    made = await dub.lead_for_partner(
+        client, api_key=key, partner_id=found.partner_id, customer_external_id=external_id(org_id),
+        country=country_of(country), customer_email=email)
+    return made, made.ok
+
+
 async def drain_once(client, *, session_factory) -> dict:
-    """Upload the due leads. No database connection is held while Dub is being called."""
+    """Upload the due leads. No database connection is held while Dub is being called.
+
+    A lead whose partner is the team's own creator or owner is dead-lettered as `self_referral`, so
+    the team's Stripe customer is never tagged and its top-ups pay no one."""
     if not enabled():
         return {"sent": 0, "reason": "disabled"}
     settings = get_settings()
     async with session_factory() as db:
         due = await _due(db, utcnow_naive())
+        owners = await _owner_inboxes(db, {row[1] for row in due}) if due else {}
     if not due:
         return {"sent": 0}
-    outcomes: dict[int, dub.Outcome] = {}
+    outcomes: dict[int, tuple[dub.Outcome, bool]] = {}
     for row_id, org_id, click_id, email, partner_code, country in due:
+        inboxes = set(owners.get(org_id, set()))
+        if email:
+            inboxes.add(promo_inbox(email))
         email = "" if _is_machine_email(email) else email
-        if click_id:
-            outcomes[row_id] = await dub.track_lead(
-                client, api_key=settings.dub_api_key, click_id=click_id,
-                customer_external_id=external_id(org_id), event_name=settings.dub_lead_event,
-                customer_email=email)
-        else:
-            outcomes[row_id] = await dub.lead_from_code(
-                client, api_key=settings.dub_api_key, link_domain=settings.dub_link_domain,
-                code=partner_code, customer_external_id=external_id(org_id),
-                country=country_of(country), customer_email=email)
+        outcomes[row_id] = await _send(client, settings, org_id=org_id, click_id=click_id,
+                                       email=email, partner_code=partner_code, country=country,
+                                       inboxes=inboxes)
     sent = retried = failed = 0
     now = utcnow_naive()
     async with session_factory() as db:
         rows = (await db.execute(
             select(AffiliateLead).where(AffiliateLead.id.in_(outcomes)))).scalars().all()
         for row in rows:
-            outcome = outcomes[row.id]
+            outcome, recorded = outcomes[row.id]
             row.attempts += 1
-            if outcome.ok:
-                row.uploaded_at, row.next_attempt_at, row.error = now, None, ""
+            if recorded:
+                row.uploaded_at = now
+            if outcome is _SELF:
+                row.failed_at, row.next_attempt_at, row.error = now, None, SELF_REFERRAL
+                failed += 1
+            elif outcome.ok:
+                row.next_attempt_at, row.error = None, ""
                 sent += 1
             elif outcome.retry:
                 row.next_attempt_at = now + _retry_delay(row.attempts)
